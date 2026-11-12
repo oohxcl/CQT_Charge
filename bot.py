@@ -7,6 +7,7 @@ import logging
 import time
 
 from listener import ChargeListener
+from free_locations import free_location_text
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,30 @@ class ChargeRobot:
             f"已加载共 {len(self.user_data)} 位用户的订阅数据和 {len(self.user_preferences)} 位用户的偏好设置"
         )
 
+    async def _get_free_location_text(self, station_id, free_count):
+        if not free_count:
+            return "空闲位置：暂无空闲插座"
+        if not hasattr(self, "_location_cache"):
+            self._location_cache = {}
+            self._location_locks = {}
+        lock = self._location_locks.setdefault(station_id, asyncio.Lock())
+        async with lock:
+            cached = self._location_cache.get(station_id)
+            if cached and time.monotonic() - cached[0] < cached[3] and cached[1] == free_count:
+                return cached[2]
+            try:
+                piles = await asyncio.wait_for(
+                    self.listener.client_controller.get_station_info(station_id), timeout=25
+                )
+                text = free_location_text(piles, free_count)
+                ttl = 15
+            except Exception as error:
+                logger.warning("Station detail query failed: %s", type(error).__name__)
+                text = "空闲位置：暂时查询失败，空闲数量仍按汇总显示，请在小程序核实位置。"
+                ttl = 2
+            self._location_cache[station_id] = (time.monotonic(), free_count, text, ttl)
+            return text
+
     def add_subscriber(
         self,
         user_id: int,
@@ -222,31 +247,6 @@ class ChargeRobot:
         async def hook(data: list):
             nonlocal subscriber_data
             station_name = subscriber_data.station_name
-            current_free_counter = data["freePileCount"]
-            prev_free_counter = subscriber_data.latest_free_count
-            subscriber_data.latest_free_count = current_free_counter
-
-            if not subscriber_data.triggered:
-                if current_free_counter >= subscriber_data.threshold:
-                    subscriber_data.triggered = True
-                    self.send_message(
-                        user_id,
-                        f"🔔 充电桩 『{station_name}』 已有足够的空闲充电位！\n当前空闲充电位数量：{current_free_counter} 🟢",
-                    )
-            else:
-                if current_free_counter != 0:
-                    if current_free_counter != prev_free_counter:
-                        self.send_message(
-                            user_id,
-                            f"📊 充电桩 『{station_name}』 空闲充电位数量发生变化！\n当前空闲充电位数量：{current_free_counter} 🟢\n输入『{self.CMD_PREFIX}{self.UNSUB_CMD} {station_name}』可结束订阅 ❌",
-                        )
-                else:
-                    self.send_message(
-                        user_id,
-                        f"🔕 充电桩 『{station_name}』 已满，订阅结束！\n如需继续订阅请重新添加 🔁",
-                    )
-                    self.remove_subscriber(user_id, station_name, echo=False)
-                    return True  # 结束订阅
             if (
                 time.time()
                 >= subscriber_data.created_at + subscriber_data.expire_in_minutes * 60
@@ -257,6 +257,37 @@ class ChargeRobot:
                 )
                 self.remove_subscriber(user_id, station_name, echo=False)
                 return True
+            current_free_counter = data["freePileCount"]
+            prev_free_counter = subscriber_data.latest_free_count
+            subscriber_data.latest_free_count = current_free_counter
+
+            if not subscriber_data.triggered:
+                if current_free_counter >= subscriber_data.threshold:
+                    subscriber_data.triggered = True
+                    locations = await self._get_free_location_text(
+                        self.listener.stations[station_name], current_free_counter
+                    )
+                    self.send_message(
+                        user_id,
+                        f"🔔 充电桩 『{station_name}』 已有足够的空闲充电位！\n当前空闲充电位数量：{current_free_counter} 🟢\n{locations}",
+                    )
+            else:
+                if current_free_counter != 0:
+                    if current_free_counter != prev_free_counter:
+                        locations = await self._get_free_location_text(
+                            self.listener.stations[station_name], current_free_counter
+                        )
+                        self.send_message(
+                            user_id,
+                            f"📊 充电桩 『{station_name}』 空闲充电位数量发生变化！\n当前空闲充电位数量：{current_free_counter} 🟢\n{locations}\n输入『{self.CMD_PREFIX}{self.UNSUB_CMD} {station_name}』可结束订阅 ❌",
+                        )
+                else:
+                    if prev_free_counter != 0:
+                        self.send_message(
+                            user_id,
+                            f"🔕 充电桩 『{station_name}』 已满，继续监测。\n再次达到空闲阈值时会提醒，无需重新订阅。",
+                        )
+                    subscriber_data.triggered = False
             return False
 
         subscriber_data.hook = hook
@@ -269,6 +300,7 @@ class ChargeRobot:
                 f"✅ 已成功订阅充电桩『{station_name}』！\n\n"
                 f"🔔 当空闲充电位 ≥ {subscriber_data.threshold} 时会通知您\n"
                 f"📊 若空闲数量变化也会再次提醒\n"
+                f"🔄 满位后继续监测，无需重新订阅\n"
                 f"⏰ 订阅将在 {subscriber_data.expire_in_minutes} 分钟后自动失效\n"
                 f"如需取消，请输入『{self.CMD_PREFIX}{self.UNSUB_CMD} {station_name}』 ❌",
             )
@@ -351,7 +383,7 @@ class ChargeRobot:
             )
             return
         msg = "📋 您当前订阅的充电桩列表：\n" + "\n".join(
-            f"• {data.station_name} ｜阈值：{data.threshold} ｜剩余：{max(0, int((data.created_at + data.expire_in_minutes * 60 - asyncio.get_event_loop().time()) / 60))} 分钟"
+            f"• {data.station_name} ｜阈值：{data.threshold} ｜剩余：{max(0, int((data.created_at + data.expire_in_minutes * 60 - time.time()) / 60))} 分钟"
             for data in self.user_data[user_id].values()
         )
         self.send_message(user_id, msg)
